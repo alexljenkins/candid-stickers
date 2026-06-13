@@ -3,17 +3,17 @@ package com.candidstickers.scan
 import android.content.ContentUris
 import android.content.Context
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.graphics.Canvas
-import android.graphics.Matrix
 import android.graphics.Rect
 import android.graphics.RectF
 import android.net.Uri
-import android.os.Build
 import android.provider.MediaStore
-import androidx.exifinterface.media.ExifInterface
+import android.util.Log
+import com.candidstickers.clip.Clip
+import com.candidstickers.clip.TagBank
 import com.candidstickers.data.CandidCrop
 import com.candidstickers.data.CropDb
+import com.candidstickers.people.PersonClusterer
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
@@ -24,7 +24,9 @@ import kotlin.math.roundToInt
 
 /**
  * The candid miner: walk MediaStore (newest first), detect faces, score
- * meme-ability, matte the keepers, persist crops.
+ * meme-ability, matte the keepers, persist crops, then enrich each crop
+ * (CLIP tags + face clustering) via [Enricher] while the photo bitmap is
+ * still in hand.
  */
 class ScanPipeline(private val context: Context, private val db: CropDb) {
 
@@ -43,11 +45,28 @@ class ScanPipeline(private val context: Context, private val db: CropDb) {
 
         FaceAnalyzer(context).use { analyzer ->
             val matte = SubjectMatte()
+            val embedder = try {
+                FaceEmbedder(context)
+            } catch (e: Exception) {
+                Log.w(TAG, "FaceEmbedder init failed; scanning without face clustering", e)
+                null
+            }
+            val enrichment = EnrichmentPass(
+                enricher = Enricher(context, db),
+                clusterer = PersonClusterer(db),
+                embedder = embedder,
+                tagBank = TagBank(db),
+            )
             try {
+                // Embed the tag vocabulary once per scan (no-op when already cached).
+                Clip.get(context)?.let { encoder ->
+                    runCatching { enrichment.tagBank.ensureReady(encoder) }
+                        .onFailure { Log.w(TAG, "Tag bank init failed; tagging degraded", it) }
+                }
                 for (photo in photos) {
                     coroutineContext.ensureActive()
                     try {
-                        found += scanOne(photo, analyzer, matte, cropsDir, onCrop)
+                        found += scanOne(photo, analyzer, matte, cropsDir, enrichment, onCrop)
                     } catch (e: Exception) {
                         // Bad/corrupt image or decoder hiccup — mark scanned, move on.
                         db.markScanned(photo.mediaId, photo.uri.toString(), photo.dateTaken, 0)
@@ -55,21 +74,33 @@ class ScanPipeline(private val context: Context, private val db: CropDb) {
                     scanned++
                     onProgress(Progress(scanned, photos.size, found))
                 }
+                runCatching { enrichment.clusterer.compact() }
+                    .onFailure { Log.w(TAG, "Person compaction failed", it) }
             } finally {
                 matte.close()
+                embedder?.close()
             }
         }
         found
     }
+
+    /** Per-scan-run enrichment collaborators: built once, shared by every [scanOne]. */
+    private class EnrichmentPass(
+        val enricher: Enricher,
+        val clusterer: PersonClusterer,
+        val embedder: FaceEmbedder?,
+        val tagBank: TagBank,
+    )
 
     private suspend fun scanOne(
         photo: PhotoRef,
         analyzer: FaceAnalyzer,
         matte: SubjectMatte,
         cropsDir: File,
+        enrichment: EnrichmentPass,
         onCrop: suspend (CandidCrop) -> Unit,
     ): Int {
-        val bitmap = decode(photo.uri) ?: run {
+        val bitmap = PhotoDecoder.decode(context, photo.uri) ?: run {
             db.markScanned(photo.mediaId, photo.uri.toString(), photo.dateTaken, 0)
             return 0
         }
@@ -83,11 +114,10 @@ class ScanPipeline(private val context: Context, private val db: CropDb) {
             val sticker = renderSticker(bitmap, face.box, matte)
             val file = File(cropsDir, "${photo.mediaId}_$index.png")
             file.outputStream().use { sticker.compress(Bitmap.CompressFormat.PNG, 100, it) }
-            if (sticker !== bitmap) sticker.recycle()
 
             val id = db.insertCrop(photo.mediaId, index, score, reason, file.absolutePath)
-            onCrop(
-                CandidCrop(
+            val crop = enrichment.enricher.enrich(
+                crop = CandidCrop(
                     id = id,
                     mediaId = photo.mediaId,
                     contentUri = photo.uri.toString(),
@@ -95,8 +125,16 @@ class ScanPipeline(private val context: Context, private val db: CropDb) {
                     score = score,
                     reason = reason,
                     cropPath = file.absolutePath,
-                )
+                ),
+                cropBitmap = sticker,
+                fullBitmap = bitmap,
+                keypoints = face.keypoints,
+                clusterer = enrichment.clusterer,
+                embedder = enrichment.embedder,
+                tagBank = enrichment.tagBank,
             )
+            if (sticker !== bitmap) sticker.recycle()
+            onCrop(crop)
             found++
         }
         db.markScanned(photo.mediaId, photo.uri.toString(), photo.dateTaken, faces.size)
@@ -171,58 +209,8 @@ class ScanPipeline(private val context: Context, private val db: CropDb) {
         return photos
     }
 
-    /** Decode orientation-corrected ARGB_8888 software bitmap, longest side ≤ [DECODE_MAX]. */
-    private fun decode(uri: Uri): Bitmap? {
-        val resolver = context.contentResolver
-        return if (Build.VERSION.SDK_INT >= 28) {
-            try {
-                android.graphics.ImageDecoder.decodeBitmap(
-                    android.graphics.ImageDecoder.createSource(resolver, uri)
-                ) { decoder, info, _ ->
-                    decoder.allocator = android.graphics.ImageDecoder.ALLOCATOR_SOFTWARE
-                    decoder.isMutableRequired = false
-                    val maxDim = max(info.size.width, info.size.height)
-                    if (maxDim > DECODE_MAX) decoder.setTargetSampleSize(maxDim / DECODE_MAX)
-                }.let { bmp ->
-                    if (bmp.config != Bitmap.Config.ARGB_8888) {
-                        bmp.copy(Bitmap.Config.ARGB_8888, false).also { bmp.recycle() }
-                    } else bmp
-                }
-            } catch (e: Exception) {
-                null
-            }
-        } else {
-            decodeLegacy(uri)
-        }
-    }
-
-    private fun decodeLegacy(uri: Uri): Bitmap? {
-        val resolver = context.contentResolver
-        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        resolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) } ?: return null
-        var sample = 1
-        while (max(bounds.outWidth, bounds.outHeight) / (sample * 2) >= DECODE_MAX) sample *= 2
-        val opts = BitmapFactory.Options().apply {
-            inSampleSize = sample
-            inPreferredConfig = Bitmap.Config.ARGB_8888
-        }
-        val bmp = resolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opts) } ?: return null
-
-        val rotation = resolver.openInputStream(uri)?.use {
-            when (ExifInterface(it).getAttributeInt(ExifInterface.TAG_ORIENTATION, 1)) {
-                ExifInterface.ORIENTATION_ROTATE_90 -> 90f
-                ExifInterface.ORIENTATION_ROTATE_180 -> 180f
-                ExifInterface.ORIENTATION_ROTATE_270 -> 270f
-                else -> 0f
-            }
-        } ?: 0f
-        if (rotation == 0f) return bmp
-        val m = Matrix().apply { postRotate(rotation) }
-        return Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true).also { bmp.recycle() }
-    }
-
     companion object {
-        private const val DECODE_MAX = 2048
+        private const val TAG = "ScanPipeline"
         private const val STICKER_SIZE = 512
     }
 }

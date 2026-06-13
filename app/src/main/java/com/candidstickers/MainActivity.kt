@@ -2,21 +2,15 @@ package com.candidstickers
 
 import android.Manifest
 import android.content.pm.PackageManager
-import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.ExperimentalFoundationApi
-import androidx.compose.foundation.background
-import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -25,10 +19,10 @@ import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
-import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Face
-import androidx.compose.material3.AlertDialog
+import androidx.compose.material.icons.filled.Person
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.Button
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -41,7 +35,6 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -53,21 +46,25 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
-import coil.compose.AsyncImage
 import com.candidstickers.data.CandidCrop
 import com.candidstickers.export.ShareSticker
+import com.candidstickers.ui.CropCell
+import com.candidstickers.ui.CropDetailDialog
 import com.candidstickers.ui.MinerViewModel
+import com.candidstickers.ui.PackNameDialog
 import com.candidstickers.ui.PacksScreen
 import com.candidstickers.ui.PacksViewModel
+import com.candidstickers.ui.PeopleScreen
+import com.candidstickers.ui.PeopleViewModel
+import com.candidstickers.ui.SearchViewModel
+import com.candidstickers.ui.SelectionBar
 import com.candidstickers.ui.SelectionState
 import com.candidstickers.work.ScanWorker
-import java.io.File
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -87,11 +84,14 @@ private val photoPermission =
 
 private const val TAB_STICKERS = 0
 private const val TAB_PACKS = 1
+private const val TAB_PEOPLE = 2
 
 @Composable
 private fun App(
     minerVm: MinerViewModel = viewModel(),
     packsVm: PacksViewModel = viewModel(),
+    peopleVm: PeopleViewModel = viewModel(),
+    searchVm: SearchViewModel = viewModel(),
 ) {
     val context = LocalContext.current
     var granted by remember {
@@ -108,17 +108,35 @@ private fun App(
         return
     }
 
-    LaunchedEffect(Unit) { minerVm.loadExisting() }
-
     var tab by rememberSaveable { mutableIntStateOf(TAB_STICKERS) }
     var selection by remember { mutableStateOf(SelectionState()) }
     val snackbarHostState = remember { SnackbarHostState() }
+
+    // Person names feed the Stickers detail dialog too, so load them up front.
+    LaunchedEffect(Unit) { peopleVm.refresh() }
+    // Re-query on tab switch: enrichment workers may have added tags/embeddings/people.
+    LaunchedEffect(tab) {
+        when (tab) {
+            TAB_STICKERS -> {
+                minerVm.loadExisting()
+                searchVm.refresh()
+            }
+            TAB_PEOPLE -> peopleVm.refresh()
+        }
+    }
 
     val message = packsVm.message
     LaunchedEffect(message) {
         if (message != null) {
             snackbarHostState.showSnackbar(message)
             packsVm.consumeMessage()
+        }
+    }
+
+    val onCreatePack: (String) -> Unit = { name ->
+        packsVm.createPack(name, selection.ids.toList()) {
+            selection = SelectionState()
+            tab = TAB_PACKS
         }
     }
 
@@ -138,24 +156,32 @@ private fun App(
                     icon = { Icon(Icons.AutoMirrored.Filled.Send, contentDescription = null) },
                     label = { Text("Packs") },
                 )
+                NavigationBarItem(
+                    selected = tab == TAB_PEOPLE,
+                    onClick = { tab = TAB_PEOPLE },
+                    icon = { Icon(Icons.Default.Person, contentDescription = null) },
+                    label = { Text("People") },
+                )
             }
         },
     ) { padding ->
         Box(Modifier.fillMaxSize().padding(padding)) {
-            if (tab == TAB_STICKERS) {
-                StickersTab(
+            when (tab) {
+                TAB_STICKERS -> StickersTab(
                     vm = minerVm,
+                    searchVm = searchVm,
+                    selection = selection,
+                    personName = { personId -> peopleVm.nameFor(personId) },
+                    onSelectionChange = { selection = it },
+                    onCreatePack = onCreatePack,
+                )
+                TAB_PACKS -> PacksScreen(packsVm)
+                TAB_PEOPLE -> PeopleScreen(
+                    vm = peopleVm,
                     selection = selection,
                     onSelectionChange = { selection = it },
-                    onCreatePack = { name ->
-                        packsVm.createPack(name, selection.ids.toList()) {
-                            selection = SelectionState()
-                            tab = TAB_PACKS
-                        }
-                    },
+                    onCreatePack = onCreatePack,
                 )
-            } else {
-                PacksScreen(packsVm)
             }
         }
     }
@@ -183,13 +209,16 @@ private fun PermissionScreen(onRequest: () -> Unit) {
 @Composable
 private fun StickersTab(
     vm: MinerViewModel,
+    searchVm: SearchViewModel,
     selection: SelectionState,
+    personName: (Long?) -> String?,
     onSelectionChange: (SelectionState) -> Unit,
     onCreatePack: (String) -> Unit,
 ) {
     val context = LocalContext.current
     var detailCrop by remember { mutableStateOf<CandidCrop?>(null) }
     var showNameDialog by remember { mutableStateOf(false) }
+    val searchState = searchVm.state
 
     Column(Modifier.fillMaxSize().padding(horizontal = 12.dp)) {
         if (selection.active) {
@@ -207,8 +236,24 @@ private fun StickersTab(
         }
 
         val progress = vm.progress
+        val enriching = vm.enriching
         if (vm.scanning) {
-            if (progress != null) {
+            if (enriching != null) {
+                if (enriching.total > 0) {
+                    LinearProgressIndicator(
+                        progress = { enriching.done.toFloat() / enriching.total },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                } else {
+                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                }
+                Text(
+                    if (enriching.total > 0) "Tagging ${enriching.done}/${enriching.total} stickers…"
+                    else "Tagging stickers…",
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.padding(vertical = 8.dp),
+                )
+            } else if (progress != null) {
                 LinearProgressIndicator(
                     progress = { progress.scanned.toFloat() / progress.total.coerceAtLeast(1) },
                     modifier = Modifier.fillMaxWidth(),
@@ -235,54 +280,78 @@ private fun StickersTab(
             }
         }
 
-        if (vm.crops.isEmpty() && !vm.scanning) {
-            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Text("No candids yet — hit the button.", style = MaterialTheme.typography.bodyMedium)
+        OutlinedTextField(
+            value = searchState.query,
+            onValueChange = searchVm::onQueryChange,
+            placeholder = { Text("Search \"crying laughing\"…") },
+            leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
+            trailingIcon = {
+                if (searchState.active) {
+                    IconButton(onClick = searchVm::clearQuery) {
+                        Icon(Icons.Default.Close, contentDescription = "Clear search")
+                    }
+                }
+            },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+        )
+        if (searchState.clipMissing) {
+            Text(
+                "Search needs the CLIP models — run scripts/fetch-models.sh",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.error,
+                modifier = Modifier.padding(bottom = 8.dp),
+            )
+        }
+
+        val gridCrops = searchState.gridCrops(vm.crops)
+        when {
+            searchState.showNoMatches -> {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Text("No matches.", style = MaterialTheme.typography.bodyMedium)
+                }
             }
-        } else {
-            LazyVerticalGrid(
-                columns = GridCells.Adaptive(110.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                items(vm.crops, key = { it.id }) { crop ->
-                    CropCell(
-                        crop = crop,
-                        selected = selection.active && crop.id in selection.ids,
-                        onClick = {
-                            if (selection.active) onSelectionChange(selection.toggle(crop.id))
-                            else detailCrop = crop
-                        },
-                        onLongClick = {
-                            onSelectionChange(
-                                if (selection.active) selection.toggle(crop.id)
-                                else selection.start(crop.id)
-                            )
-                        },
-                    )
+            gridCrops.isEmpty() && !vm.scanning && !searchState.active -> {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Text("No candids yet — hit the button.", style = MaterialTheme.typography.bodyMedium)
+                }
+            }
+            else -> {
+                LazyVerticalGrid(
+                    columns = GridCells.Adaptive(110.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    items(gridCrops, key = { it.id }) { crop ->
+                        CropCell(
+                            crop = crop,
+                            selected = selection.active && crop.id in selection.ids,
+                            onClick = {
+                                if (selection.active) onSelectionChange(selection.toggle(crop.id))
+                                else detailCrop = crop
+                            },
+                            onLongClick = {
+                                onSelectionChange(
+                                    if (selection.active) selection.toggle(crop.id)
+                                    else selection.start(crop.id)
+                                )
+                            },
+                        )
+                    }
                 }
             }
         }
     }
 
     detailCrop?.let { crop ->
-        AlertDialog(
-            onDismissRequest = { detailCrop = null },
-            confirmButton = {
-                TextButton(onClick = {
-                    ShareSticker.share(context, crop)
-                    detailCrop = null
-                }) { Text("Share") }
+        CropDetailDialog(
+            crop = crop,
+            personName = personName(crop.personId),
+            onShare = {
+                ShareSticker.share(context, crop)
+                detailCrop = null
             },
-            dismissButton = { TextButton(onClick = { detailCrop = null }) { Text("Close") } },
-            title = { Text("${crop.reason} · ${"%.0f".format(crop.score * 100)}%") },
-            text = {
-                AsyncImage(
-                    model = Uri.parse(crop.contentUri),
-                    contentDescription = "Original photo",
-                    modifier = Modifier.fillMaxWidth(),
-                )
-            },
+            onDismiss = { detailCrop = null },
         )
     }
 
@@ -293,93 +362,6 @@ private fun StickersTab(
                 showNameDialog = false
                 onCreatePack(name)
             },
-        )
-    }
-}
-
-@Composable
-private fun SelectionBar(
-    selection: SelectionState,
-    onCancel: () -> Unit,
-    onCreatePack: () -> Unit,
-) {
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
-    ) {
-        IconButton(onClick = onCancel) {
-            Icon(Icons.Default.Close, contentDescription = "Cancel selection")
-        }
-        Text(
-            "${selection.count} selected",
-            style = MaterialTheme.typography.titleMedium,
-            modifier = Modifier.weight(1f),
-        )
-        Button(onClick = onCreatePack, enabled = selection.canCreatePack) {
-            Text("Create pack (${selection.count})")
-        }
-    }
-}
-
-@Composable
-private fun PackNameDialog(onDismiss: () -> Unit, onCreate: (String) -> Unit) {
-    var name by remember { mutableStateOf("Candids") }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Pack name") },
-        text = {
-            OutlinedTextField(
-                value = name,
-                onValueChange = { name = it },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
-            )
-        },
-        confirmButton = {
-            TextButton(
-                onClick = { onCreate(name.trim()) },
-                enabled = name.isNotBlank(),
-            ) { Text("Create") }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
-    )
-}
-
-@OptIn(ExperimentalFoundationApi::class)
-@Composable
-private fun CropCell(
-    crop: CandidCrop,
-    selected: Boolean,
-    onClick: () -> Unit,
-    onLongClick: () -> Unit,
-) {
-    Column(Modifier.combinedClickable(onClick = onClick, onLongClick = onLongClick)) {
-        Box(
-            Modifier
-                .fillMaxWidth()
-                .aspectRatio(1f)
-                .background(Color(0xFF2A2A2E)),
-            contentAlignment = Alignment.Center,
-        ) {
-            AsyncImage(
-                model = File(crop.cropPath),
-                contentDescription = crop.reason,
-                modifier = Modifier.fillMaxSize().padding(4.dp),
-            )
-            if (selected) {
-                Box(Modifier.matchParentSize().background(Color(0x66000000)))
-                Icon(
-                    Icons.Default.CheckCircle,
-                    contentDescription = "Selected",
-                    tint = MaterialTheme.colorScheme.primary,
-                    modifier = Modifier.align(Alignment.TopEnd).padding(4.dp),
-                )
-            }
-        }
-        Text(
-            "${crop.reason} · ${"%.0f".format(crop.score * 100)}%",
-            style = MaterialTheme.typography.labelSmall,
-            maxLines = 1,
         )
     }
 }

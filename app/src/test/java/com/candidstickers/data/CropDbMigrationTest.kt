@@ -36,7 +36,7 @@ class CropDbMigrationTest {
 
         val db = CropDb.getInstance(context)
         val raw = db.readableDatabase
-        assertEquals(2, raw.version)
+        assertEquals(3, raw.version)
 
         // v1 rows survived the migration
         assertEquals(setOf(42L), db.scannedMediaIds())
@@ -60,9 +60,13 @@ class CropDbMigrationTest {
         assertTrue("embedding (v1) missing", "embedding" in cropCols)
 
         // new tables exist
-        for (table in listOf("persons", "packs", "pack_stickers")) {
+        for (table in listOf("persons", "packs", "pack_stickers", "tag_bank")) {
             assertTrue("$table table missing", tableExists(raw, table))
         }
+
+        // v3 defaults on a migrated crop
+        assertEquals(emptyList<String>(), crop.tags)
+        assertNull(crop.personId)
 
         // pack API round-trip on the migrated database
         val packId = db.insertPack("candid-pack-1", "Candid Pack", "Alex", 1_700_000_000_000L)
@@ -103,6 +107,46 @@ class CropDbMigrationTest {
             c.moveToFirst()
             assertEquals(0, c.getInt(0))
         }
+    }
+
+    @Test
+    fun upgradeFromV2AddsTagBankAndKeepsRows() {
+        createV1DatabaseWithData()
+        // Promote v1 -> v2 with the exact v2 migration SQL, then stamp version 2.
+        val file = context.getDatabasePath(CropDb.DATABASE_NAME)
+        SQLiteDatabase.openDatabase(file.path, null, SQLiteDatabase.OPEN_READWRITE).use { db ->
+            db.execSQL("ALTER TABLE crops ADD COLUMN person_id INTEGER")
+            db.execSQL("ALTER TABLE crops ADD COLUMN tags TEXT")
+            db.execSQL("ALTER TABLE crops ADD COLUMN face_embedding BLOB")
+            db.execSQL("CREATE TABLE persons(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, centroid BLOB, face_count INTEGER NOT NULL DEFAULT 0)")
+            db.execSQL(
+                "CREATE TABLE packs(id INTEGER PRIMARY KEY AUTOINCREMENT, identifier TEXT NOT NULL UNIQUE, " +
+                    "name TEXT NOT NULL, publisher TEXT NOT NULL, tray_file TEXT NOT NULL DEFAULT '', " +
+                    "image_data_version INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL)"
+            )
+            db.execSQL(
+                "CREATE TABLE pack_stickers(pack_id INTEGER NOT NULL REFERENCES packs(id) ON DELETE CASCADE, " +
+                    "crop_id INTEGER NOT NULL REFERENCES crops(id), file_name TEXT NOT NULL, " +
+                    "emojis TEXT NOT NULL, position INTEGER NOT NULL, PRIMARY KEY(pack_id, crop_id))"
+            )
+            db.execSQL("INSERT INTO persons(name, centroid, face_count) VALUES ('Alex', NULL, 3)")
+            db.version = 2
+        }
+
+        val db = CropDb.getInstance(context)
+        assertEquals(3, db.readableDatabase.version)
+        assertTrue(tableExists(db.readableDatabase, "tag_bank"))
+
+        // v2 rows survived
+        assertEquals(1, db.cropCount())
+        val persons = db.persons()
+        assertEquals(1, persons.size)
+        assertEquals("Alex", persons[0].name)
+        assertEquals(3, persons[0].faceCount)
+
+        // tag_bank usable straight after migration
+        db.putTagBank("crying laughing", byteArrayOf(1, 2, 3, 4))
+        assertTrue(byteArrayOf(1, 2, 3, 4).contentEquals(db.tagBank()["crying laughing"]))
     }
 
     /** Builds a database with raw SQL identical to CropDb v1 onCreate, plus one photo + crop. */

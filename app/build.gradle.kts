@@ -35,7 +35,7 @@ android {
         compose = true
     }
     androidResources {
-        noCompress += listOf("tflite", "task")
+        noCompress += listOf("tflite", "task", "onnx")
     }
     testOptions {
         unitTests {
@@ -58,6 +58,10 @@ dependencies {
     implementation(libs.compose.material3)
     implementation(libs.mediapipe.tasks.vision)
     implementation(libs.mlkit.subject.segmentation)
+    implementation(libs.onnxruntime.android)
+    // LiteRT exposes the org.tensorflow.lite.Interpreter API; never add
+    // org.tensorflow:tensorflow-lite alongside it (duplicate classes).
+    implementation(libs.litert)
     implementation(libs.coil.compose)
     implementation(libs.kotlinx.coroutines.play.services)
 

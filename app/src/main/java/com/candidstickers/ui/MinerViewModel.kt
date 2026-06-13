@@ -8,6 +8,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.candidstickers.data.CandidCrop
 import com.candidstickers.data.CropDb
+import com.candidstickers.scan.Enricher
 import com.candidstickers.scan.ScanPipeline
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -18,6 +19,7 @@ class MinerViewModel(app: Application) : AndroidViewModel(app) {
 
     private val db = CropDb.getInstance(app)
     private val pipeline = ScanPipeline(app, db)
+    private val enricher = Enricher(app, db)
     private var scanJob: Job? = null
 
     var crops by mutableStateOf<List<CandidCrop>>(emptyList())
@@ -25,6 +27,10 @@ class MinerViewModel(app: Application) : AndroidViewModel(app) {
     var scanning by mutableStateOf(false)
         private set
     var progress by mutableStateOf<ScanPipeline.Progress?>(null)
+        private set
+
+    /** Non-null while the post-scan backfill is tagging/clustering old crops. */
+    var enriching by mutableStateOf<Enricher.Progress?>(null)
         private set
 
     fun loadExisting() {
@@ -47,8 +53,17 @@ class MinerViewModel(app: Application) : AndroidViewModel(app) {
                         }
                     },
                 )
+                // Catch up crops that predate the models (or were scanned
+                // before the CLIP assets were fetched).
+                withContext(Dispatchers.Main) { enriching = Enricher.Progress(0, 0) }
+                enricher.backfill { p -> withContext(Dispatchers.Main) { enriching = p } }
+                // Backfill may have added tags/persons to crops already shown.
+                crops = withContext(Dispatchers.IO) { db.topCrops() }
             } finally {
-                withContext(Dispatchers.Main) { scanning = false }
+                withContext(Dispatchers.Main) {
+                    scanning = false
+                    enriching = null
+                }
             }
         }
     }

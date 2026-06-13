@@ -8,6 +8,7 @@ import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import com.candidstickers.data.CropDb
+import com.candidstickers.scan.Enricher
 import com.candidstickers.scan.ScanPipeline
 import java.util.concurrent.TimeUnit
 
@@ -19,6 +20,7 @@ class ScanWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
         val db = CropDb.getInstance(applicationContext)
         return try {
             ScanPipeline(applicationContext, db).scan()
+            Enricher(applicationContext, db).backfill()
             Result.success()
         } catch (e: Exception) {
             Result.retry()
