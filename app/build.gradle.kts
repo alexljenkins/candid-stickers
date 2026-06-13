@@ -15,6 +15,8 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "0.1"
+
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildTypes {
@@ -35,6 +37,14 @@ android {
     androidResources {
         noCompress += listOf("tflite", "task")
     }
+    testOptions {
+        unitTests {
+            isIncludeAndroidResources = true
+            // Robolectric defaults to legacy shadow graphics here, where Canvas
+            // draws are no-ops; sticker rendering tests need real Skia pixels.
+            all { it.systemProperty("robolectric.graphicsMode", "NATIVE") }
+        }
+    }
 }
 
 dependencies {
@@ -50,4 +60,13 @@ dependencies {
     implementation(libs.mlkit.subject.segmentation)
     implementation(libs.coil.compose)
     implementation(libs.kotlinx.coroutines.play.services)
+
+    testImplementation(libs.junit)
+    testImplementation(libs.robolectric)
+    testImplementation(libs.androidx.test.core.ktx)
+    testImplementation(libs.androidx.test.ext.junit.ktx)
+
+    androidTestImplementation(libs.androidx.test.runner)
+    androidTestImplementation(libs.androidx.test.rules)
+    androidTestImplementation(libs.androidx.test.ext.junit)
 }

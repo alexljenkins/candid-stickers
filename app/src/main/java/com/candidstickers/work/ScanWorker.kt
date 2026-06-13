@@ -15,14 +15,13 @@ import java.util.concurrent.TimeUnit
 class ScanWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
 
     override suspend fun doWork(): Result {
-        val db = CropDb(applicationContext)
+        // Process-wide singleton (shared with StickerContentProvider) — never closed.
+        val db = CropDb.getInstance(applicationContext)
         return try {
             ScanPipeline(applicationContext, db).scan()
             Result.success()
         } catch (e: Exception) {
             Result.retry()
-        } finally {
-            db.close()
         }
     }
 

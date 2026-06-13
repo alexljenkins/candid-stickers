@@ -16,7 +16,7 @@ import kotlinx.coroutines.withContext
 
 class MinerViewModel(app: Application) : AndroidViewModel(app) {
 
-    private val db = CropDb(app)
+    private val db = CropDb.getInstance(app)
     private val pipeline = ScanPipeline(app, db)
     private var scanJob: Job? = null
 
@@ -55,6 +55,6 @@ class MinerViewModel(app: Application) : AndroidViewModel(app) {
 
     override fun onCleared() {
         scanJob?.cancel()
-        db.close()
+        // CropDb is a process-wide singleton (shared with StickerContentProvider) — never close it.
     }
 }

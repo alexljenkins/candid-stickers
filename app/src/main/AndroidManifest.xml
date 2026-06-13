@@ -6,6 +6,12 @@
         android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="32" />
 
+    <!-- Needed on API 30+ to resolve/launch the WhatsApp add-pack intent -->
+    <queries>
+        <package android:name="com.whatsapp" />
+        <package android:name="com.whatsapp.w4b" />
+    </queries>
+
     <application
         android:label="Candid Stickers"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar"
@@ -24,5 +30,25 @@
         <meta-data
             android:name="com.google.mlkit.vision.DEPENDENCIES"
             android:value="subject_segment" />
+
+        <!-- WhatsApp reads sticker packs through this provider; authority MUST
+             start with the package name and the read permission MUST be
+             com.whatsapp.sticker.READ -->
+        <provider
+            android:name=".export.StickerContentProvider"
+            android:authorities="com.candidstickers.stickercontentprovider"
+            android:enabled="true"
+            android:exported="true"
+            android:readPermission="com.whatsapp.sticker.READ" />
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="com.candidstickers.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
     </application>
 </manifest>
